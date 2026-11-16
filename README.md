@@ -28,9 +28,15 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
+| POST | `/api/v1/subscriptions` | Register a subscriber (starts at version 0) |
+| GET | `/api/v1/subscriptions/me` | A subscriber's progress |
+| POST | `/api/v1/subscriptions/claims` | Claim the next image notification (lease 60 s) |
+| POST | `/api/v1/subscriptions/confirmations` | Confirm a claimed version after ingesting it |
 | GET | `/healthz` | Liveness, database and current-version check |
 
-`/docs` supports submitting (multipart form), browsing and downloading.
+`/docs` supports submitting (multipart form), browsing and downloading, and
+exercising the full subscription flow (set the two `X-Subscriber-*` headers on
+the claim/confirm calls).
 
 ### Submitting
 
@@ -100,15 +106,109 @@ Errors use `{"detail": {...}}` with `code` and `message`; raster errors also
 carry `slot` (`a`/`b`) and, where applicable, `field` (`crs`, `resolution`,
 `grid_alignment`, `dimensions`, `block_no`).
 
+## Subscriptions (hydrology model ingest)
+
+A subscriber represents one model input database. After registering it starts
+at version **0** and pulls the published images strictly in publication order,
+one notification at a time:
+
+```
+POST /api/v1/subscriptions                 -> subscriber_id + secret (shown once)
+POST /api/v1/subscriptions/claims          -> one notification + a 60 s claim token
+GET  /api/v1/mosaics/{version}/download    -> download the pinned image
+POST /api/v1/subscriptions/confirmations   -> confirm ingestion; progress advances
+```
+
+### Registering
+
+`POST /api/v1/subscriptions` with an optional `{"name": "..."}` returns a
+`subscriber_id` and a `secret`. The secret is returned only once; claim and
+confirm calls must send both as the `X-Subscriber-Id` and
+`X-Subscriber-Secret` headers.
+
+### Claim notifications
+
+`POST /api/v1/subscriptions/claims` returns the smallest version the
+subscriber has not yet acknowledged. Each notification contains:
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Publication sequence number, starting at 1 |
+| `day` | Observation day of the image (`YYYY-MM-DD`) |
+| `replaced_version` | Version of the image published earlier for that same day that this one supersedes; `null` for the day's first publication |
+| `sha256` | SHA-256 of the GeoTIFF bytes |
+| `download_url` | Fixed, immutable download address for this version |
+| `claim.token` | Opaque credential required to confirm this version |
+| `claim.lease_expires_at` | UTC instant at which the 60 s lease expires |
+
+Delivery and locking rules:
+
+* Only **committed** publications are ever returned; a publication still in
+  flight is invisible to subscribers.
+* While a claim is open, repeat calls return the *same* notification and the
+  *same* token. After the 60 second lease expires the same version may be
+  re-claimed, which invalidates the old token.
+* If the image file is temporarily unavailable the claim **stops at that
+  version** with `503 image_unavailable` and opens no lease, so later versions
+  can never be reached out of order; retrying once the file is back resumes at
+  exactly that version.
+* A confirm must present the active token of the exact next version. Repeating
+  a completed confirmation is idempotent (`"repeated": true`) and never skips a
+  version; a token from an expired or re-claimed lease is rejected
+  (`409 lease_expired` / `409 claim_superseded`), so an old credential cannot
+  move progress. Out-of-order confirms get `409 invalid_claim_token`.
+* When no new version exists, the claim returns `404 no_notification` without
+  creating any lease.
+* All state is transactional and persisted: a publication and a confirmation
+  racing each other, or a service restart, never lose, duplicate or reorder a
+  version. Subscribers are independent rows and never affect one another.
+* Reads run on WAL snapshots and take the write lock only for the short
+  lease/confirm updates, so subscription traffic does not block publishing or
+  downloads.
+
+A minimal ingest loop:
+
+```bash
+BASE=http://localhost:8000/api/v1
+AUTH=(-H "X-Subscriber-Id: $SID" -H "X-Subscriber-Secret: $SECRET")
+
+while true; do
+  note=$(curl -sS -X POST "${AUTH[@]}" "$BASE/subscriptions/claims") || { sleep 5; continue; }
+  echo "$note" | grep -q no_notification && { sleep 60; continue; }
+  ver=$(echo "$note" | python -c 'import sys,json;print(json.load(sys.stdin)["version"])')
+  token=$(echo "$note" | python -c 'import sys,json;print(json.load(sys.stdin)["claim"]["token"])')
+  url=$(echo "$note" | python -c 'import sys,json;print(json.load(sys.stdin)["download_url"])')
+  curl -sSf "http://localhost:8000$url" -o "v$ver.tif"
+  # ... verify the SHA-256 and write v$ver.tif into the model input store ...
+  curl -sS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+       -d "{\"version\": $ver, \"claim_token\": \"$token\"}" \
+       "$BASE/subscriptions/confirmations"
+done
+```
+
+`GET /api/v1/subscriptions/me` reports `last_ack_version`,
+`latest_published_version` and the number of `pending_versions`.
+
+### Same-day republishing
+
+Submitting a new mosaic for an observation day that already has a version does
+not delete anything: the new version is appended, becomes current, and records
+the previous same-day version as `supersedes_version` (exposed as
+`replaced_version` in notifications and in the version metadata). Every old
+version remains downloadable at its fixed URL.
+
 ## Design notes
 
 * SQLite runs in WAL mode with `synchronous=FULL`; state lives in
   `$RAINMOSAIC_DATA_DIR/rainmosaic.sqlite3`, images in `versions/`, scratch files
-  in `tmp/`.
+  in `tmp/`. Subscriber, lease and claim-token tables live in the same database
+  and are created (and, where needed, migrated) at startup.
 * Startup validates the schema, repairs a dangling current pointer and removes
   old orphan files left by interrupted publications.
 * Generation and file I/O run in a worker thread so other requests, including
-  downloads, keep flowing.
+  downloads, keep flowing. Subscription claims and confirms do all their read
+  checks on a WAL snapshot and only take the write lock for the short lease or
+  progress update.
 * Only one API worker is used by default: SQLite plus a local disk volume make
   horizontal scaling a deployment concern rather than a code feature.
 
@@ -123,7 +223,12 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination and error handling, plus
+the full subscription state machine: ordered delivery, repeated and idempotent
+confirms, 60 second lease expiry and re-claim, stale-token rejection,
+unavailable-image blocking, concurrent claim/confirm races against a real
+uvicorn server, in-flight publication isolation, subscriber independence and
+schema migration from a release-1 database.
 
 ## Configuration
 
@@ -131,5 +236,6 @@ publication, restart persistence, listing/pagination and error handling.
 | --- | --- | --- |
 | `RAINMOSAIC_DATA_DIR` | `/data` in the image, `./data` locally | Writable persistent directory |
 | `RAINMOSAIC_MAX_UPLOAD_BYTES` | `2097152` | Per-file upload cap |
+| `RAINMOSAIC_CLAIM_LEASE_SECONDS` | `60` | Subscription claim lease duration |
 | `RAINMOSAIC_PORT` | `8000` | Listen port |
 | `RAINMOSAIC_LOG_LEVEL` | `INFO` | Log level |

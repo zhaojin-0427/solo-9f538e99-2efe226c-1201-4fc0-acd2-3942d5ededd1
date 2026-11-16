@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS versions (
     nodata         INTEGER NOT NULL,
     sha256         TEXT    NOT NULL,
     size_bytes     INTEGER NOT NULL,
-    block_meta     TEXT    NOT NULL
+    block_meta     TEXT    NOT NULL,
+    supersedes_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS versions_day_idx ON versions(day);
 
@@ -66,6 +67,15 @@ CREATE TABLE IF NOT EXISTS state (
 
 CURRENT_STATE_KEY = "current_version"
 ORPHAN_GRACE_SECONDS = 3600.0
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first release to older databases."""
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(versions)")}
+    if "supersedes_version" not in columns:
+        conn.execute("ALTER TABLE versions ADD COLUMN supersedes_version INTEGER")
+        log.info("migrated versions table: added supersedes_version column")
 
 
 class VersionConflict(Exception):
@@ -119,6 +129,7 @@ def init_store(settings: Settings) -> None:
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
         conn.execute(
             "INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
             (CURRENT_STATE_KEY, "0"),
@@ -195,11 +206,15 @@ def _fetch_row(conn: sqlite3.Connection, version: int) -> sqlite3.Row | None:
 
 
 def _row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
     return {
         "version": int(row["version"]),
         "day": row["day"],
         "status": row["status"],
         "published_at": row["published_at"],
+        "supersedes_version": (
+            int(row["supersedes_version"]) if "supersedes_version" in keys and row["supersedes_version"] is not None else None
+        ),
         "image": {
             "width": int(row["width"]),
             "height": int(row["height"]),
@@ -344,6 +359,15 @@ def publish(
 
         new_version = max(current_version, _max_version(conn)) + 1
 
+        # A re-publication for an already observed day replaces that day's
+        # previously newest version.  Subscribers receive this pointer in the
+        # notification for the new version.
+        superseded_row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM versions WHERE day = ?",
+            (day,),
+        ).fetchone()
+        supersedes_version = int(superseded_row["v"]) or None
+
         # Heavy work happens while the write lock is held.  Readers in WAL
         # mode keep seeing and downloading the old current version.
         info = rasters.write_mosaic(left, right, temp_path)
@@ -363,8 +387,8 @@ def publish(
             INSERT INTO versions (
                 version, day, status, published_at, width, height, crs_wkt,
                 crs_label, transform, bounds, res_x, res_y, dtype, nodata,
-                sha256, size_bytes, block_meta
-            ) VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sha256, size_bytes, block_meta, supersedes_version
+            ) VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_version,
@@ -383,6 +407,7 @@ def publish(
                 sha256,
                 size_bytes,
                 json.dumps(block_meta),
+                supersedes_version,
             ),
         )
         _write_pointer(conn, new_version)

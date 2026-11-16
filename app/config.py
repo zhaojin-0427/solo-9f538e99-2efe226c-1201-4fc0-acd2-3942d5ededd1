@@ -12,6 +12,7 @@ class Settings:
     data_dir: Path
     max_upload_bytes: int = 2 * 1024 * 1024
     sqlite_timeout_seconds: float = 30.0
+    claim_lease_seconds: float = 60.0
 
     @property
     def db_path(self) -> Path:
@@ -37,4 +38,12 @@ def load_settings() -> Settings:
     max_upload_bytes = int(raw_limit) if raw_limit else 2 * 1024 * 1024
     if max_upload_bytes < 1:
         raise ValueError("RAINMOSAIC_MAX_UPLOAD_BYTES must be positive")
-    return Settings(data_dir=data_dir, max_upload_bytes=max_upload_bytes)
+    raw_lease = os.environ.get("RAINMOSAIC_CLAIM_LEASE_SECONDS")
+    claim_lease_seconds = float(raw_lease) if raw_lease else 60.0
+    if claim_lease_seconds <= 0:
+        raise ValueError("RAINMOSAIC_CLAIM_LEASE_SECONDS must be positive")
+    return Settings(
+        data_dir=data_dir,
+        max_upload_bytes=max_upload_bytes,
+        claim_lease_seconds=claim_lease_seconds,
+    )

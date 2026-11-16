@@ -9,14 +9,15 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Path as PathParam, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, store
+from . import __version__, store, subscriptions
 from .config import Settings, load_settings
 from .limits import BodyLimitMiddleware
 from .rasters import RasterInputError, load_block, validate_pair
@@ -107,6 +108,26 @@ def error_response(status: int, code: str, message: str, **extra: Any) -> JSONRe
     return JSONResponse(status_code=status, content={"detail": detail})
 
 
+class RegisterBody(BaseModel):
+    name: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional human-readable subscriber name",
+    )
+
+
+class ConfirmBody(BaseModel):
+    version: int = Field(
+        ge=1,
+        description="Version taken from the claim notification being confirmed",
+    )
+    claim_token: str = Field(
+        min_length=8,
+        max_length=256,
+        description="Active claim token returned when this version was claimed",
+    )
+
+
 def _validate_version_number(value: int) -> int:
     if value < 0:
         raise HTTPException(
@@ -124,6 +145,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         resolved = settings if settings is not None else load_settings()
         store.init_store(resolved)
+        init_conn = store.connect(resolved)
+        try:
+            subscriptions.init_subscriptions(init_conn)
+        finally:
+            init_conn.close()
         app.state.settings = resolved
         # Two files plus multipart framing, with a little headroom.
         app.state.body_limit_bytes = 2 * resolved.max_upload_bytes + 1024 * 1024
@@ -489,6 +515,167 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 },
             )
         return _file_response(record)
+
+    # ------------------------------------------------------------------
+    # Subscriptions: hydrology-model ingest jobs pull one notification at
+    # a time, download the pinned image, then confirm the ingestion.
+    # ------------------------------------------------------------------
+
+    def _subscription_error(exc: subscriptions.SubscriptionError) -> HTTPException:
+        return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+    @app.post(
+        "/api/v1/subscriptions",
+        status_code=201,
+        tags=["subscriptions"],
+        summary="Register a subscriber; progress starts at version 0",
+        responses={422: {"description": "Invalid request body"}},
+    )
+    def register_subscriber(request: Request, body: RegisterBody) -> dict:
+        current_settings = get_settings(request)
+        conn = store.connect(current_settings)
+        try:
+            subscriber = subscriptions.register(conn, body.name)
+        finally:
+            conn.close()
+        return {
+            "subscriber_id": subscriber.subscriber_id,
+            "name": subscriber.name,
+            "secret": subscriber.secret,
+            "created_at": subscriber.created_at,
+            "last_ack_version": 0,
+            "lease_seconds": current_settings.claim_lease_seconds,
+            "message": (
+                "store the secret: it is shown once and is required as "
+                "X-Subscriber-Secret on claim and confirm calls"
+            ),
+        }
+
+    @app.get(
+        "/api/v1/subscriptions/me",
+        tags=["subscriptions"],
+        summary="Inspect this subscriber's progress",
+        responses={401: {"description": "Missing or wrong credentials"}},
+    )
+    def subscription_status(
+        request: Request,
+        x_subscriber_id: Annotated[str | None, Header()] = None,
+        x_subscriber_secret: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        conn = store.connect(get_settings(request))
+        try:
+            subscriber = subscriptions.authenticate(conn, x_subscriber_id, x_subscriber_secret)
+            return subscriptions.status(conn, subscriber)
+        except subscriptions.SubscriptionError as exc:
+            raise _subscription_error(exc) from exc
+        finally:
+            conn.close()
+
+    @app.post(
+        "/api/v1/subscriptions/claims",
+        tags=["subscriptions"],
+        summary="Claim the next published image notification (one version at a time)",
+        description=(
+            "Returns the notification for the smallest version this subscriber has "
+            "not yet acknowledged, in publication order. Each notification carries "
+            "the observation day, the version, the version replaced for that same "
+            "observation day (`replaced_version`, null when it is the day's first "
+            "publication), the image SHA-256 and its fixed download URL.\n\n"
+            "Only already committed publications are ever returned. While a claim "
+            "is open, repeat calls return the same notification with the same "
+            "credential; once the 60 second lease expires the same version can be "
+            "re-claimed, which invalidates the old token. If the image file is "
+            "temporarily unavailable the call stops at that version with 503 and "
+            "opens no lease, so the subscriber retries the same version."
+        ),
+        responses={
+            200: {"description": "Notification for the next (or currently leased) version"},
+            401: {"description": "Missing or wrong credentials"},
+            404: {"description": "No new published version available yet"},
+            503: {"description": "Image file for the next version is unavailable"},
+        },
+    )
+    async def claim_notification(
+        request: Request,
+        x_subscriber_id: Annotated[str | None, Header()] = None,
+        x_subscriber_secret: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        current_settings = get_settings(request)
+
+        def work() -> dict:
+            conn = store.connect(current_settings)
+            try:
+                subscriber = subscriptions.authenticate(
+                    conn, x_subscriber_id, x_subscriber_secret
+                )
+                return subscriptions.claim(conn, subscriber, settings=current_settings)
+            except subscriptions.SubscriptionError as exc:
+                raise _subscription_error(exc) from exc
+            except subscriptions.StoreBusy as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "store_busy",
+                        "message": str(exc),
+                    },
+                ) from exc
+            finally:
+                conn.close()
+
+        return await run_in_threadpool(work)
+
+    @app.post(
+        "/api/v1/subscriptions/confirmations",
+        tags=["subscriptions"],
+        summary="Confirm a claimed version after downloading and ingesting it",
+        description=(
+            "Moves the subscriber's progress to the confirmed version. Only the "
+            "currently active claim token for the exact next expected version is "
+            "accepted. Confirming the same version again is idempotent and never "
+            "skips a version; a token from an expired, re-claimed lease is "
+            "rejected, so an old credential can never advance progress."
+        ),
+        responses={
+            200: {"description": "Version confirmed, progress advanced (or idempotent replay)"},
+            401: {"description": "Missing or wrong credentials"},
+            409: {"description": "No active claim, bad/stale token, or out-of-order version"},
+            422: {"description": "Invalid request body"},
+        },
+    )
+    async def confirm_notification(
+        request: Request,
+        body: ConfirmBody,
+        x_subscriber_id: Annotated[str | None, Header()] = None,
+        x_subscriber_secret: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        current_settings = get_settings(request)
+
+        def work() -> dict:
+            conn = store.connect(current_settings)
+            try:
+                subscriber = subscriptions.authenticate(
+                    conn, x_subscriber_id, x_subscriber_secret
+                )
+                return subscriptions.confirm(
+                    conn,
+                    subscriber,
+                    version=body.version,
+                    token=body.claim_token,
+                )
+            except subscriptions.SubscriptionError as exc:
+                raise _subscription_error(exc) from exc
+            except subscriptions.StoreBusy as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "store_busy",
+                        "message": str(exc),
+                    },
+                ) from exc
+            finally:
+                conn.close()
+
+        return await run_in_threadpool(work)
 
     return app
 
